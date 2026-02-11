@@ -1,6 +1,6 @@
 import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
-import definePlugin, { OptionType, PluginNative } from "@utils/types";
+import definePlugin, { OptionType } from "@utils/types";
 import {
     DraftType,
     SelectedChannelStore,
@@ -13,9 +13,8 @@ type ProcessResult =
     | { success: true; file: File; size: number; }
     | { success: false; fileName: string; error: string; };
 
-const Native = VencordNative.pluginHelpers.AutoCompress as PluginNative<
-    typeof import("./native")
->;
+const Native = VencordNative?.pluginHelpers?.dogCompress as any;
+
 const FORMATS = new Set([
     "video/mp4",
     "video/quicktime",
@@ -30,32 +29,32 @@ const FORMATS = new Set([
 const settings = definePluginSettings({
     ffmpegTimeout: {
         type: OptionType.NUMBER,
-        description: "Duration per file before compression aborted [seconds]",
+        description: "Maximum time per file before compression is aborted [seconds]",
         default: 10
     },
     ffmpegPath: {
         type: OptionType.STRING,
-        description: "Path to ffmpeg binary (empty will attempt to resolve automatically)"
+        description: "Path to ffmpeg binary (leave empty to attempt auto-detection)"
     },
     ffprobePath: {
         type: OptionType.STRING,
-        description: "Path to ffprobe binary (empty will attempt to resolve automatically)"
+        description: "Path to ffprobe binary (leave empty to attempt auto-detection)"
     },
     compressionTarget: {
         type: OptionType.NUMBER,
-        description: "File size to target with compression [mb]",
+        description: "Target file size after compression [MB]",
         default: 9,
     },
     compressionThreshold: {
         type: OptionType.NUMBER,
-        description: "Maximum file size before compression is used [mb]",
+        description: "Maximum file size before compression is applied [MB]",
         default: 10,
     },
     compressionPreset: {
         type: OptionType.SELECT,
-        description: "Encoding speed (slower results in better quality at the same size)",
+        description: "Encoding speed (slower = better quality at the same size)",
         options: [
-            { label: "Fastest", value: "ultrafast" },
+            { label: "Ultrafast", value: "ultrafast" },
             { label: "Fast", value: "fast" },
             { label: "Medium (Balanced)", value: "medium", default: true },
             { label: "Slow", value: "slow" },
@@ -64,8 +63,7 @@ const settings = definePluginSettings({
     },
     maxResolution: {
         type: OptionType.SELECT,
-        description:
-            "Maximum resolution (downscaling MAY result in better quality with low bitrates)",
+        description: "Maximum resolution (downscaling may improve quality at low bitrates)",
         options: [
             { label: "Keep Original", value: "original", default: true },
             { label: "1080p", value: "1080" },
@@ -80,48 +78,61 @@ function isValid(files: FileList | undefined): files is FileList {
 }
 
 async function validateBinaries() {
-    // check that ffmpeg & ffprobe are found and reachable
-    const validated = await Native.testBinaries(settings.store.ffmpegPath, settings.store.ffprobePath);
-    if (!validated.success) {
+    // Check if Native exists and has the required functions
+    if (!Native || typeof Native.testBinaries !== "function") {
         showNotification({
-            title: "AutoCompress",
-            body: `Failed validation with: ${validated}`,
+            title: "dogCompress",
+            body: "Native module (FFmpeg bridge) not found or not loaded. Sending files without compression.",
+            color: "#faa61a",
+            noPersist: false,
+        });
+        return false;
+    }
+
+    try {
+        const validated = await Native.testBinaries(settings.store.ffmpegPath, settings.store.ffprobePath);
+        if (!validated.success) {
+            showNotification({
+                title: "dogCompress",
+                body: `FFmpeg validation failed: ${validated.error || "unknown error"}`,
+                color: "#f04747",
+                noPersist: false,
+            });
+            return false;
+        }
+        return true;
+    } catch (err) {
+        showNotification({
+            title: "dogCompress",
+            body: `Error validating FFmpeg: ${err.message || "unknown"}`,
             color: "#f04747",
             noPersist: false,
         });
         return false;
     }
-    return true;
 }
 
 async function hookPaste(event: ClipboardEvent) {
     const files = event.clipboardData?.files;
-    if (!isValid(files) || !(await validateBinaries())) {
-        return;
-    }
+    if (!isValid(files) || !(await validateBinaries())) return;
 
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-
     await handleFiles(files);
 }
 
 async function hookDrop(event: DragEvent) {
     const files = event.dataTransfer?.files;
-    if (!isValid(files) || !(await validateBinaries())) {
-        return;
-    }
+    if (!isValid(files) || !(await validateBinaries())) return;
 
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-
     await handleFiles(files);
 }
 
 async function handleFiles(files: FileList) {
-
     const allFiles = Array.from(files);
     const compressibleFiles: File[] = [];
     const otherFiles: File[] = [];
@@ -134,13 +145,12 @@ async function handleFiles(files: FileList) {
         }
         otherFiles.push(file);
     }
+
     const channelId = SelectedChannelStore.getChannelId();
-    if (!channelId) {
-        return;
-    }
+    if (!channelId) return;
+
     UploadManager.clearAll(channelId, DraftType.ChannelMessage);
 
-    // handles situation in which no compressible files are included
     if (compressibleFiles.length === 0) {
         if (otherFiles.length > 0) {
             UploadManager.addFiles({
@@ -152,22 +162,22 @@ async function handleFiles(files: FileList) {
         }
         return;
     }
+
     showToast(
-        `Preparing to compress ${compressibleFiles.length}/${files.length} file(s)`,
+        `Preparing to compress ${compressibleFiles.length} file(s)...`,
         Toasts.Type.MESSAGE,
     );
 
     const results = await Promise.all(
         compressibleFiles.map(file => processFile(file)),
     );
+
     const successful = results.filter(r => r.success);
     const failed = results.filter(r => !r.success);
     const toUpload = [...successful.map(r => r.file), ...otherFiles];
-    // slightly scary looking ternary that formats the output message
-    const message = `Compressed ${successful.length}/${results.length} file(s)${failed.length > 0
-        ? `\nFailed: ${failed.map(f => `${f.fileName} (${f.error})`).join(", ")}`
-        : ""
-        }`;
+
+    const message = `Compressed ${successful.length}/${results.length} file(s)` +
+        (failed.length > 0 ? `\nFailures: ${failed.map(f => `${f.fileName} (${f.error})`).join(", ")}` : "");
 
     if (toUpload.length > 0) {
         UploadManager.addFiles({
@@ -178,15 +188,14 @@ async function handleFiles(files: FileList) {
         });
     }
 
-    const color =
-        failed.length === 0
-            ? "#43b581"
-            : successful.length === 0
-                ? "#f04747"
-                : "#faa61a";
+    const color = failed.length === 0
+        ? "#43b581"
+        : successful.length === 0
+            ? "#f04747"
+            : "#faa61a";
 
     showNotification({
-        title: "AutoCompress",
+        title: "dogCompress",
         body: message,
         color: color,
         noPersist: false,
@@ -245,15 +254,14 @@ export default definePlugin({
     description: "Automatically compress videos/audio to reach a target size",
     authors: [{ name: "Dogaix", id: 668445750044262400n }],
     settings,
-
     start() {
         document.addEventListener("drop", hookDrop, { capture: true });
         document.addEventListener("dragover", hookDrag, { capture: true });
         document.addEventListener("paste", hookPaste, { capture: true });
     },
-
     stop() {
         document.removeEventListener("drop", hookDrop, { capture: true });
         document.removeEventListener("dragover", hookDrag, { capture: true });
+        document.removeEventListener("paste", hookPaste, { capture: true });
     },
 });
