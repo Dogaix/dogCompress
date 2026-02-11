@@ -1,4 +1,4 @@
-# dogCompress Plugin
+# dogCompress Vencord Plugin
 
 The dogCompress plugin automatically compresses videos and audio files, significantly reducing their file sizes while maintaining high-quality playback. This tool is essential for users looking to optimize file storage and improve streaming speeds.
 
